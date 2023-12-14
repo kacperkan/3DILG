@@ -1,41 +1,44 @@
+import argparse
 import math
 
-import argparse
-
 parser = argparse.ArgumentParser()
-parser.add_argument('--model', default='vqvae_512_1024_2048', type=str,
-                    metavar='MODEL', help='Name of model to train')
-parser.add_argument('--pth', default='output/vqvae_512_1024_2048/checkpoint-799.pth', type=str)
-parser.add_argument('--device', default='cuda',
-                    help='device to use for training / testing')
-parser.add_argument('--seed', default=0, type=int)
-parser.add_argument('--data_path', required=True, type=str,
-                    help='dataset path')
+parser.add_argument(
+    "--model",
+    default="vqvae_512_1024_2048",
+    type=str,
+    metavar="MODEL",
+    help="Name of model to train",
+)
+parser.add_argument(
+    "--pth", default="output/vqvae_512_1024_2048/checkpoint-799.pth", type=str
+)
+parser.add_argument(
+    "--device", default="cuda", help="device to use for training / testing"
+)
+parser.add_argument("--seed", default=0, type=int)
+parser.add_argument(
+    "--data_path", required=True, type=str, help="dataset path"
+)
 args = parser.parse_args()
 
-from tqdm import tqdm 
+from pathlib import Path
 
-import yaml
-
-import torch
-import torch.nn.functional as F
-import torch.backends.cudnn as cudnn
-
-import torchvision.transforms as T
-
-import numpy as np
-
-from scipy.spatial import cKDTree as KDTree
-
-import trimesh
 import mcubes
+import numpy as np
+import torch
+import torch.backends.cudnn as cudnn
+import torch.nn.functional as F
+import torchvision.transforms as T
+import trimesh
+import yaml
+from scipy.spatial import cKDTree as KDTree
+from timm.models import create_model
+from tqdm import tqdm
 
 import modeling_vqvae
-from shapenet import ShapeNet, category_ids
-from timm.models import create_model
 import utils
+from shapenet import ShapeNet, category_ids
 
-from pathlib import Path
 
 def main():
     print(args)
@@ -51,30 +54,44 @@ def main():
     device = torch.device(args.device)
 
     model.eval()
-    model.load_state_dict(torch.load(args.pth, map_location='cpu')['model'], strict=True)
+    model.load_state_dict(
+        torch.load(args.pth, map_location="cpu")["model"], strict=True
+    )
     model.to(device)
 
-
     density = 128
-    gap = 2. / density
-    x = np.linspace(-1, 1, density+1)
-    y = np.linspace(-1, 1, density+1)
-    z = np.linspace(-1, 1, density+1)
+    gap = 2.0 / density
+    x = np.linspace(-1, 1, density + 1)
+    y = np.linspace(-1, 1, density + 1)
+    z = np.linspace(-1, 1, density + 1)
     xv, yv, zv = np.meshgrid(x, y, z)
-    grid = torch.from_numpy(np.stack([xv, yv, zv]).astype(np.float32)).view(3, -1).transpose(0, 1)[None].cuda()
+    grid = (
+        torch.from_numpy(np.stack([xv, yv, zv]).astype(np.float32))
+        .view(3, -1)
+        .transpose(0, 1)[None]
+        .cuda()
+    )
 
     with torch.no_grad():
-        
         metric_loggers = []
         for category, _ in category_ids.items():
             metric_logger = utils.MetricLogger(delimiter="  ")
             metric_loggers.append(metric_logger)
-            header = 'Test:'
+            header = "Test:"
 
-            dataset_test = ShapeNet(args.data_path, split='test', categories=[category], transform=None, sampling=False, return_surface=True, surface_sampling=False)
+            dataset_test = ShapeNet(
+                args.data_path,
+                split="test",
+                categories=[category],
+                transform=None,
+                sampling=False,
+                return_surface=True,
+                surface_sampling=False,
+            )
             sampler_test = torch.utils.data.SequentialSampler(dataset_test)
             data_loader_test = torch.utils.data.DataLoader(
-                dataset_test, sampler=sampler_test,
+                dataset_test,
+                sampler=sampler_test,
                 batch_size=1,
                 num_workers=12,
                 drop_last=False,
@@ -83,7 +100,9 @@ def main():
             for batch in metric_logger.log_every(data_loader_test, 10, header):
                 points, labels, surface, _ = batch
 
-                ind = np.random.default_rng().choice(surface[0].numpy().shape[0], 2048, replace=False)
+                ind = np.random.default_rng().choice(
+                    surface[0].numpy().shape[0], 2048, replace=False
+                )
 
                 surface2048 = surface[0][ind][None]
 
@@ -93,27 +112,50 @@ def main():
 
                 N = 50000
 
-                _, latents, centers_quantized, _, _, _ = model.encode(surface2048)
+                _, latents, centers_quantized, _, _, _ = model.encode(
+                    surface2048
+                )
                 centers = centers_quantized.float() / 255.0 * 2 - 1
 
-                output = torch.cat([model.decoder(latents, centers, points[:, i*N:(i+1)*N])[0] for i in range(math.ceil(grid.shape[1]/N))], dim=1)
+                output = torch.cat(
+                    [
+                        model.decoder(
+                            latents, centers, points[:, i * N : (i + 1) * N]
+                        )[0]
+                        for i in range(math.ceil(grid.shape[1] / N))
+                    ],
+                    dim=1,
+                )
 
                 pred = torch.zeros_like(output[0])
-                pred[output[0]>=0] = 1
+                pred[output[0] >= 0] = 1
                 intersection = (pred * labels[0]).sum()
                 union = (pred + labels[0]).gt(0).sum()
                 iou = intersection * 1.0 / union
 
                 metric_logger.update(iou=iou.item())
 
-                output = torch.cat([model.decoder(latents, centers, grid[:, i*N:(i+1)*N])[0] for i in range(math.ceil(grid.shape[1]/N))], dim=1)
+                output = torch.cat(
+                    [
+                        model.decoder(
+                            latents, centers, grid[:, i * N : (i + 1) * N]
+                        )[0]
+                        for i in range(math.ceil(grid.shape[1] / N))
+                    ],
+                    dim=1,
+                )
 
-                volume = output.view(density+1, density+1, density+1).permute(1, 0, 2).cpu().numpy()
+                volume = (
+                    output.view(density + 1, density + 1, density + 1)
+                    .permute(1, 0, 2)
+                    .cpu()
+                    .numpy()
+                )
                 verts, faces = mcubes.marching_cubes(volume, 0)
                 verts *= gap
-                verts -= 1.
+                verts -= 1.0
                 m = trimesh.Trimesh(verts, faces)
-                
+
                 pred = m.sample(100000)
 
                 tree = KDTree(pred)
@@ -138,17 +180,30 @@ def main():
                     recall = float(sum(d < th for d in d2)) / float(len(d2))
                     precision = float(sum(d < th for d in d1)) / float(len(d1))
 
-                    if recall+precision > 0:
+                    if recall + precision > 0:
                         fscore = 2 * recall * precision / (recall + precision)
                     else:
                         fscore = 0
                 metric_logger.update(fscore=fscore)
 
-            print(category, metric_logger.iou.avg, metric_logger.cd.avg, metric_logger.fscore.avg)
+            print(
+                category,
+                metric_logger.iou.avg,
+                metric_logger.cd.avg,
+                metric_logger.fscore.avg,
+            )
 
         print(args)
-        for (category, _), metric_logger in zip(category_ids.items(), metric_loggers):
-            print(category, metric_logger.iou.avg, metric_logger.cd.avg, metric_logger.fscore.avg)
+        for (category, _), metric_logger in zip(
+            category_ids.items(), metric_loggers
+        ):
+            print(
+                category,
+                metric_logger.iou.avg,
+                metric_logger.cd.avg,
+                metric_logger.fscore.avg,
+            )
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()

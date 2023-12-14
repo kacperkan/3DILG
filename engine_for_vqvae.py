@@ -4,35 +4,59 @@ from typing import Iterable, Optional
 
 import torch
 import torch.nn.functional as F
-
 from timm.utils import ModelEma
 
 import utils
 
+
 def train_batch(model, surface, points, labels, criterion):
-    outputs, z_e_x, z_q_x, sigma, loss_commit, perplexity = model(surface, points)
+    outputs, z_e_x, z_q_x, sigma, loss_commit, perplexity = model(
+        surface, points
+    )
 
     loss_vol = criterion(outputs[:, :1024], labels[:, :1024])
     loss_near = criterion(outputs[:, 1024:], labels[:, 1024:])
 
     loss_sigma = sigma.mean()
 
-    loss = loss_vol + 0.1 * loss_near + loss_commit + 0.0001 * loss_sigma 
+    loss = loss_vol + 0.1 * loss_near + loss_commit + 0.0001 * loss_sigma
 
-    return loss, outputs, loss_vol.item(), loss_near.item(), loss_commit.item(), loss_sigma.item()
+    return (
+        loss,
+        outputs,
+        loss_vol.item(),
+        loss_near.item(),
+        loss_commit.item(),
+        loss_sigma.item(),
+    )
 
 
-def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
-                    data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
-                    model_ema: Optional[ModelEma] = None, log_writer=None,
-                    start_steps=None, lr_schedule_values=None, wd_schedule_values=None,
-                    num_training_steps_per_epoch=None, update_freq=None):
+def train_one_epoch(
+    model: torch.nn.Module,
+    criterion: torch.nn.Module,
+    data_loader: Iterable,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    epoch: int,
+    loss_scaler,
+    max_norm: float = 0,
+    model_ema: Optional[ModelEma] = None,
+    log_writer=None,
+    start_steps=None,
+    lr_schedule_values=None,
+    wd_schedule_values=None,
+    num_training_steps_per_epoch=None,
+    update_freq=None,
+):
     model.train(True)
     metric_logger = utils.MetricLogger(delimiter="  ")
-    metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    metric_logger.add_meter('min_lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    header = 'Epoch: [{}]'.format(epoch)
+    metric_logger.add_meter(
+        "lr", utils.SmoothedValue(window_size=1, fmt="{value:.6f}")
+    )
+    metric_logger.add_meter(
+        "min_lr", utils.SmoothedValue(window_size=1, fmt="{value:.6f}")
+    )
+    header = "Epoch: [{}]".format(epoch)
     print_freq = 10
 
     if loss_scaler is None:
@@ -41,17 +65,28 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     else:
         optimizer.zero_grad()
 
-    for data_iter_step, (points, labels, surface, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for data_iter_step, (points, labels, surface, _) in enumerate(
+        metric_logger.log_every(data_loader, print_freq, header)
+    ):
         step = data_iter_step // update_freq
         if step >= num_training_steps_per_epoch:
             continue
         it = start_steps + step  # global training iteration
         # Update LR & WD for the first acc
-        if lr_schedule_values is not None or wd_schedule_values is not None and data_iter_step % update_freq == 0:
+        if (
+            lr_schedule_values is not None
+            or wd_schedule_values is not None
+            and data_iter_step % update_freq == 0
+        ):
             for i, param_group in enumerate(optimizer.param_groups):
                 if lr_schedule_values is not None:
-                    param_group["lr"] = lr_schedule_values[it] * param_group["lr_scale"]
-                if wd_schedule_values is not None and param_group["weight_decay"] > 0:
+                    param_group["lr"] = (
+                        lr_schedule_values[it] * param_group["lr_scale"]
+                    )
+                if (
+                    wd_schedule_values is not None
+                    and param_group["weight_decay"] > 0
+                ):
                     param_group["weight_decay"] = wd_schedule_values[it]
 
         surface = surface.to(device, non_blocking=True)
@@ -62,9 +97,15 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             raise NotImplementedError
         else:
             with torch.cuda.amp.autocast(enabled=True):
+                (
+                    loss,
+                    output,
+                    loss_vol,
+                    loss_near,
+                    loss_commit,
+                    loss_sigma,
+                ) = train_batch(model, surface, points, labels, criterion)
 
-                loss, output, loss_vol, loss_near, loss_commit, loss_sigma = train_batch(model, surface, points, labels, criterion)
-        
         loss_value = loss.item()
 
         if not math.isfinite(loss_value):
@@ -75,25 +116,33 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             raise NotImplementedError
         else:
             # this attribute is added by timm on one optimizer (adahessian)
-            is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
+            is_second_order = (
+                hasattr(optimizer, "is_second_order")
+                and optimizer.is_second_order
+            )
             loss /= update_freq
-            grad_norm = loss_scaler(loss, optimizer, clip_grad=max_norm,
-                                    parameters=model.parameters(), create_graph=is_second_order,
-                                    update_grad=(data_iter_step + 1) % update_freq == 0)
+            grad_norm = loss_scaler(
+                loss,
+                optimizer,
+                clip_grad=max_norm,
+                parameters=model.parameters(),
+                create_graph=is_second_order,
+                update_grad=(data_iter_step + 1) % update_freq == 0,
+            )
             if (data_iter_step + 1) % update_freq == 0:
                 optimizer.zero_grad()
                 if model_ema is not None:
                     model_ema.update(model)
             loss_scale_value = loss_scaler.state_dict()["scale"]
 
-                    
         torch.cuda.synchronize()
 
-
         pred = torch.zeros_like(output[:, :1024])
-        pred[output[:, :1024]>=0] = 1
+        pred[output[:, :1024] >= 0] = 1
 
-        accuracy = (pred==labels[:, :1024]).float().sum(dim=1) / labels[:, :1024].shape[1]
+        accuracy = (pred == labels[:, :1024]).float().sum(dim=1) / labels[
+            :, :1024
+        ].shape[1]
         accuracy = accuracy.mean()
         intersection = (pred * labels[:, :1024]).sum(dim=1)
         union = (pred + labels[:, :1024]).gt(0).sum(dim=1) + 1e-5
@@ -108,9 +157,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         metric_logger.update(loss_commit=loss_commit)
         metric_logger.update(loss_sigma=loss_sigma)
 
-
-        min_lr = 10.
-        max_lr = 0.
+        min_lr = 10.0
+        max_lr = 0.0
         for group in optimizer.param_groups:
             min_lr = min(min_lr, group["lr"])
             max_lr = max(max_lr, group["lr"])
@@ -141,12 +189,13 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
+
 @torch.no_grad()
 def evaluate(data_loader, model, device):
     criterion = torch.nn.BCEWithLogitsLoss()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
-    header = 'Test:'
+    header = "Test:"
 
     model.eval()
 
@@ -162,11 +211,10 @@ def evaluate(data_loader, model, device):
             output, _, _, _, _, perplexity = model(surface, points)
             loss = criterion(output, labels)
 
-
         pred = torch.zeros_like(output)
-        pred[output>=0] = 1
+        pred[output >= 0] = 1
 
-        accuracy = (pred==labels).float().sum(dim=1) / labels.shape[1]
+        accuracy = (pred == labels).float().sum(dim=1) / labels.shape[1]
         accuracy = accuracy.mean()
         intersection = (pred * labels).sum(dim=1)
         union = (pred + labels).gt(0).sum(dim=1)
@@ -175,10 +223,13 @@ def evaluate(data_loader, model, device):
 
         batch_size = surface.shape[0]
         metric_logger.update(loss=loss.item())
-        metric_logger.meters['iou'].update(iou.item(), n=batch_size)
+        metric_logger.meters["iou"].update(iou.item(), n=batch_size)
 
     metric_logger.synchronize_between_processes()
 
-    print('* iou{iou.global_avg:.4f} loss {losses.global_avg:.3f}'
-          .format(iou=metric_logger.iou, losses=metric_logger.loss))
+    print(
+        "* iou{iou.global_avg:.4f} loss {losses.global_avg:.3f}".format(
+            iou=metric_logger.iou, losses=metric_logger.loss
+        )
+    )
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
